@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.tylerscomic-lab/mcp-trust-audit-mcp",
+  "title": "MCP Trust & Tool-Poisoning Audit",
+  "description": "Audits MCP tool definitions for tool-poisoning (hidden agent-directed instructions in descriptions) and tool-shadowing (invisible/homoglyph Unicode, near-duplicate names) attack patterns.",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/tylerscomic-lab/mcp-trust-audit-mcp",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp-trust-audit-mcp.mcpize.run/mcp"
+    }
+  ]
+}

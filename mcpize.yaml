@@ -1,0 +1,13 @@
+version: 1
+name: mcp-trust-audit-mcp
+description: Audits MCP tool definitions for documented tool-poisoning and tool-shadowing attack patterns -- hidden agent-directed instructions in descriptions, sensitive-path references, invisible/homoglyph Unicode in tool names, and near-duplicate tool names.
+runtime: typescript
+entry: server.js
+build:
+  install: npm install
+startCommand:
+  type: http
+  command: node server.js
+  port: 8080
+  healthCheck: /health
+  mcpPath: /mcp
