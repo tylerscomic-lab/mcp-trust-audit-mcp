@@ -1,6 +1,6 @@
 version: 1
 name: mcp-trust-audit-mcp
-description: Audits MCP tool definitions for documented tool-poisoning and tool-shadowing attack patterns -- hidden agent-directed instructions in descriptions, sensitive-path references, invisible/homoglyph Unicode in tool names, and near-duplicate tool names.
+description: Audits MCP servers for tool-poisoning and tool-shadowing attacks. Scan a remote server by URL or paste its tool list: hidden agent-directed instructions, sensitive-path references, invisible or homoglyph Unicode in names, near-duplicate tool names.
 runtime: typescript
 entry: server.js
 build:

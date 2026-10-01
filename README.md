@@ -61,3 +61,6 @@ node server.js
 ## License
 
 MIT
+
+## Update 1.1.0 (2026-10-01)
+- New tool `scan_remote_server`: give it a public https MCP URL and it performs the handshake, fetches the tool list and audits it. No credentials sent; private and internal addresses (including DNS-rebinding) are refused; 10 second timeout, 1 MB cap.

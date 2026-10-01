@@ -2,6 +2,78 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import http from 'http';
+import https from 'https';
+import dns from 'dns';
+import net from 'net';
+
+// ── Remote scan plumbing ──────────────────────────────────────────────────
+// scan_remote_server connects OUT to a user-supplied URL, so it is hardened
+// against SSRF: https only, hostname only (no IP literals), every resolved
+// address is checked at connect time (closes DNS-rebinding), no redirects,
+// 10s timeout, 1 MB response cap, and no credentials are ever sent.
+function isBlockedIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+  }
+  const l = ip.toLowerCase();
+  return l === '::1' || l === '::' || l.startsWith('fc') || l.startsWith('fd') || l.startsWith('fe80') || /^::ffff:(127|10|0|169\.254|192\.168|172\.(1[6-9]|2\d|3[01]))\./.test(l);
+}
+function safeLookup(hostname, options, cb) {
+  dns.lookup(hostname, { ...options, all: true }, (err, addrs) => {
+    if (err) return cb(err);
+    if (addrs.some((a) => isBlockedIp(a.address))) return cb(new Error('Refusing to connect to a private or internal address'));
+    if (options && options.all) return cb(null, addrs);
+    cb(null, addrs[0].address, addrs[0].family);
+  });
+}
+function rpcPost(urlStr, payload, sessionId) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const body = JSON.stringify(payload);
+    const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'content-length': Buffer.byteLength(body), 'user-agent': 'mcp-trust-audit-mcp/1.1' };
+    if (sessionId) headers['mcp-session-id'] = sessionId;
+    const req = https.request({ hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: 'POST', headers, lookup: safeLookup, timeout: 10000 }, (res) => {
+      let size = 0; const chunks = [];
+      res.on('data', (c) => { size += c.length; if (size > 1_000_000) { req.destroy(new Error('Response larger than 1 MB')); return; } chunks.push(c); });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('timeout', () => req.destroy(new Error('Timed out after 10 seconds')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+function parseRpc(resp) {
+  const ct = String(resp.headers['content-type'] || '');
+  if (ct.includes('text/event-stream')) {
+    const datas = resp.text.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim());
+    for (let i = datas.length - 1; i >= 0; i--) { try { return JSON.parse(datas[i]); } catch { /* try previous */ } }
+    return null;
+  }
+  try { return JSON.parse(resp.text); } catch { return null; }
+}
+async function fetchRemoteTools(urlStr) {
+  const u = new URL(urlStr);
+  if (u.protocol !== 'https:') throw new Error('Only https:// MCP endpoints can be scanned');
+  if (net.isIP(u.hostname) || u.hostname === 'localhost' || !u.hostname.includes('.')) throw new Error('Use a public hostname, not an IP address or internal name');
+  const init = await rpcPost(urlStr, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'mcp-trust-audit-mcp', version: '1.1.0' } } });
+  if (init.status === 401 || init.status === 403) return { authRequired: true, status: init.status };
+  const initBody = parseRpc(init);
+  if (!initBody || initBody.error || !initBody.result) throw new Error(`Server did not complete the MCP handshake (HTTP ${init.status}). It may not be a streamable-HTTP MCP endpoint.`);
+  const sid = init.headers['mcp-session-id'];
+  await rpcPost(urlStr, { jsonrpc: '2.0', method: 'notifications/initialized' }, sid).catch(() => {});
+  const tools = [];
+  let cursor;
+  for (let page = 0; page < 5; page++) {
+    const r = await rpcPost(urlStr, { jsonrpc: '2.0', id: 2 + page, method: 'tools/list', params: cursor ? { cursor } : {} }, sid);
+    const b = parseRpc(r);
+    if (!b || b.error) throw new Error(`tools/list failed: ${b?.error?.message || 'HTTP ' + r.status}`);
+    tools.push(...(b.result?.tools || []));
+    cursor = b.result?.nextCursor;
+    if (!cursor) break;
+  }
+  return { tools, serverInfo: initBody.result.serverInfo || null, protocolVersion: initBody.result.protocolVersion || null };
+}
 
 // ── MCP tool-definition trust audit ──────────────────────────────────────
 // Checks a set of MCP tool definitions (name/description/inputSchema, the
@@ -186,6 +258,21 @@ function buildServer() {
       const findings = [];
       auditTool({ name: '(single check)', description }, findings);
       return { content: [{ type: 'text', text: JSON.stringify({ suspicious: findings.some((f) => f.severity === 'critical'), findings }, null, 2) }] };
+    }
+  );
+
+  server.tool('scan_remote_server',
+    'Connects to a public remote MCP server by its https URL, performs the MCP handshake, downloads its tool list and audits it for tool poisoning and tool shadowing in one step. Use this before adding someone else\'s remote MCP server to your agent. Sends no credentials. Servers that require authentication cannot be scanned this way: paste their tools/list JSON into audit_tool_definitions instead. Refuses private/internal addresses.',
+    { url: z.string().url().describe('Full https URL of the streamable-HTTP MCP endpoint, e.g. https://example.com/mcp') },
+    async ({ url }) => {
+      try {
+        const r = await fetchRemoteTools(url);
+        if (r.authRequired) return { content: [{ type: 'text', text: JSON.stringify({ scanned: false, reason: `The server requires authentication (HTTP ${r.status}). No credentials are sent by this tool. Get the tools/list response through your own authenticated client and pass it to audit_tool_definitions.` }, null, 2) }] };
+        const audit = auditToolset(r.tools);
+        return { content: [{ type: 'text', text: JSON.stringify({ scanned: true, url, serverInfo: r.serverInfo, protocolVersion: r.protocolVersion, ...audit, note: 'Static analysis of the advertised tool list only. A server can behave differently from how it describes itself; this does not execute any tool.' }, null, 2) }] };
+      } catch (e) {
+        return { isError: true, content: [{ type: 'text', text: `Could not scan ${url}: ${e.message}` }] };
+      }
     }
   );
 
